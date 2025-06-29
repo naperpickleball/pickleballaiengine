@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PickleballAI Coach Dashboard
-Web interface for coaches to manage annotation requests
+Web interface for coaches to manage annotation requests and videos
 """
 
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
@@ -12,8 +12,9 @@ from datetime import datetime
 from typing import Dict, List, Optional
 import secrets
 
-# Import the notification system
+# Import the notification system and video permissions
 from coach_notification_system import CoachNotificationSystem
+from video_permission_system import VideoPermissionSystem
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
@@ -22,6 +23,7 @@ CORS(app)
 class CoachDashboard:
     def __init__(self):
         self.notification_system = CoachNotificationSystem()
+        self.video_permissions = VideoPermissionSystem()
         self.data_dir = "data"
         self.coaches_file = os.path.join(self.data_dir, "coaches.json")
         self.requests_file = os.path.join(self.data_dir, "annotation_requests.json")
@@ -55,8 +57,24 @@ class CoachDashboard:
         return None
     
     def get_coach_requests(self, coach_email: str) -> List[Dict]:
-        """Get all requests for a specific coach"""
-        return self.notification_system.get_pending_requests(coach_email)
+        """Get all requests for a specific coach with video information"""
+        requests = self.notification_system.get_pending_requests(coach_email)
+        
+        # Add video information to each request
+        for req in requests:
+            if "video_id" in req:
+                video = self.video_permissions.get_video(req["video_id"])
+                if video:
+                    req["video_info"] = video
+                    req["user_permissions"] = self.video_permissions.get_user_permissions(
+                        req["video_id"], coach_email
+                    )
+        
+        return requests
+    
+    def get_coach_videos(self, coach_email: str) -> List[Dict]:
+        """Get all videos the coach has access to"""
+        return self.video_permissions.get_user_videos(coach_email)
     
     def get_coach_stats(self, coach_email: str) -> Dict:
         """Get coach statistics"""
@@ -64,13 +82,16 @@ class CoachDashboard:
         requests = data.get("requests", [])
         
         coach_requests = [req for req in requests if req.get("coach_email") == coach_email]
+        coach_videos = self.get_coach_videos(coach_email)
         
         stats = {
             "total_requests": len(coach_requests),
             "pending_requests": len([req for req in coach_requests if req["status"] == "pending"]),
             "accepted_requests": len([req for req in coach_requests if req["status"] == "accepted"]),
             "completed_requests": len([req for req in coach_requests if req["status"] == "completed"]),
-            "total_earnings": sum(req.get("estimated_cost", 0) for req in coach_requests if req["status"] in ["accepted", "completed"])
+            "total_earnings": sum(req.get("estimated_cost", 0) for req in coach_requests if req["status"] in ["accepted", "completed"]),
+            "total_videos": len(coach_videos),
+            "videos_with_annotations": len([v for v in coach_videos if v.get("annotations")])
         }
         
         return stats
@@ -154,11 +175,43 @@ def dashboard_page():
     coach = dashboard.notification_system.get_coach_by_email(coach_email)
     stats = dashboard.get_coach_stats(coach_email)
     requests = dashboard.get_coach_requests(coach_email)
+    videos = dashboard.get_coach_videos(coach_email)
     
     return render_template('coach_dashboard.html', 
                          coach=coach, 
                          stats=stats, 
-                         requests=requests)
+                         requests=requests,
+                         videos=videos)
+
+@app.route('/videos')
+def videos_page():
+    if 'coach_email' not in session:
+        return redirect(url_for('login'))
+    
+    coach_email = session['coach_email']
+    videos = dashboard.get_coach_videos(coach_email)
+    
+    return render_template('coach_videos.html', videos=videos)
+
+@app.route('/video/<video_id>')
+def video_detail(video_id):
+    if 'coach_email' not in session:
+        return redirect(url_for('login'))
+    
+    coach_email = session['coach_email']
+    
+    # Check if coach has access to this video
+    if not dashboard.video_permissions.check_permissions(video_id, coach_email, "read"):
+        return render_template('error.html', error="Access denied to this video")
+    
+    video = dashboard.video_permissions.get_video(video_id)
+    permissions = dashboard.video_permissions.get_user_permissions(video_id, coach_email)
+    annotations = dashboard.video_permissions.get_video_annotations(video_id, coach_email)
+    
+    return render_template('video_detail.html', 
+                         video=video, 
+                         permissions=permissions,
+                         annotations=annotations)
 
 @app.route('/logout')
 def logout():
@@ -197,6 +250,55 @@ def api_request_action(request_id, action):
         return jsonify({"success": True, "message": f"Request {action}ed successfully"})
     else:
         return jsonify({"error": "Request not found"}), 404
+
+@app.route('/api/videos', methods=['GET'])
+def api_videos():
+    if 'coach_email' not in session:
+        return jsonify({"error": "Not authenticated"}), 401
+    
+    coach_email = session['coach_email']
+    videos = dashboard.get_coach_videos(coach_email)
+    
+    return jsonify({"success": True, "videos": videos})
+
+@app.route('/api/videos/<video_id>/annotations', methods=['GET', 'POST'])
+def api_video_annotations(video_id):
+    if 'coach_email' not in session:
+        return jsonify({"error": "Not authenticated"}), 401
+    
+    coach_email = session['coach_email']
+    
+    if request.method == 'GET':
+        result = dashboard.video_permissions.get_video_annotations(video_id, coach_email)
+        return jsonify(result)
+    
+    elif request.method == 'POST':
+        data = request.json
+        annotations = data.get('annotations', [])
+        
+        result = dashboard.video_permissions.add_video_annotations(
+            video_id=video_id,
+            annotations=annotations,
+            added_by=coach_email
+        )
+        
+        return jsonify(result)
+
+@app.route('/api/videos/<video_id>/analysis', methods=['POST'])
+def api_video_analysis(video_id):
+    if 'coach_email' not in session:
+        return jsonify({"error": "Not authenticated"}), 401
+    
+    coach_email = session['coach_email']
+    data = request.json
+    
+    result = dashboard.video_permissions.update_video_analysis(
+        video_id=video_id,
+        analysis_data=data,
+        updated_by=coach_email
+    )
+    
+    return jsonify(result)
 
 @app.route('/api/stats')
 def api_stats():

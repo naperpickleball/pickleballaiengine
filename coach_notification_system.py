@@ -7,11 +7,14 @@ Handles email notifications for coach annotation requests
 import smtplib
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Dict, List, Optional
 import logging
+
+# Import the video permission system
+from video_permission_system import VideoPermissionSystem
 
 class CoachNotificationSystem:
     def __init__(self):
@@ -19,6 +22,9 @@ class CoachNotificationSystem:
         self.coaches_file = os.path.join(self.data_dir, "coaches.json")
         self.requests_file = os.path.join(self.data_dir, "annotation_requests.json")
         self.logs_dir = "logs"
+        
+        # Initialize video permission system
+        self.video_permissions = VideoPermissionSystem()
         
         # Ensure directories exist
         os.makedirs(self.data_dir, exist_ok=True)
@@ -95,7 +101,7 @@ class CoachNotificationSystem:
     def create_coach_request(self, student_email: str, student_name: str, 
                            coach_email: str, coach_name: str, 
                            video_filename: str, message: str = "") -> Dict:
-        """Create a new annotation request"""
+        """Create a new annotation request with video permissions"""
         data = self._load_data(self.requests_file)
         
         request = {
@@ -117,7 +123,7 @@ class CoachNotificationSystem:
         data.setdefault("requests", []).append(request)
         self._save_data(self.requests_file, data)
         
-        self.logger.info(f"Created annotation request: {request['id']} from {student_email} to {coach_email}")
+        self._log_action("CREATE_COACH", f"Created coach: {email} ({name})")
         return request
     
     def _calculate_cost(self, coach_email: str) -> float:
@@ -162,7 +168,7 @@ class CoachNotificationSystem:
                     "message": request["message"],
                     "estimated_cost": request["estimated_cost"],
                     "request_id": request["id"],
-                    "login_url": "http://localhost:5000/coach/login"
+                    "login_url": "http://localhost:5001/coach/login"
                 }
             )
             
@@ -220,6 +226,7 @@ class CoachNotificationSystem:
                     .button {{ background: #667eea; color: white; padding: 12px 24px; 
                               text-decoration: none; border-radius: 5px; display: inline-block; }}
                     .highlight {{ background: #fff3cd; padding: 10px; border-radius: 5px; margin: 10px 0; }}
+                    .permissions {{ background: #d4edda; padding: 10px; border-radius: 5px; margin: 10px 0; }}
                 </style>
             </head>
             <body>
@@ -241,6 +248,14 @@ class CoachNotificationSystem:
                             • Request ID: {context['request_id']}
                         </div>
                         
+                        <div class="permissions">
+                            <strong>🔐 Video Access Permissions:</strong><br>
+                            • ✅ Read access to video<br>
+                            • ✅ Edit access for annotations<br>
+                            • ❌ Delete access (student only)<br>
+                            <small>You can view, analyze, and annotate the video but cannot delete it.</small>
+                        </div>
+                        
                         {f"<p><strong>Student Message:</strong><br>{context['message']}</p>" if context['message'] else ""}
                         
                         <p>To review and respond to this request, please log into your coach dashboard:</p>
@@ -258,10 +273,84 @@ class CoachNotificationSystem:
         
         return "Email template not found"
     
+    def get_logs(self, days: int = 1):
+        """Get logs for the specified number of days"""
+        logs = []
+        
+        for i in range(days):
+            date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+            log_file = os.path.join(self.logs_dir, f"coach_notifications_{date}.log")
+            
+            if os.path.exists(log_file):
+                with open(log_file, 'r') as f:
+                    content = f.read()
+                    if content.strip():
+                        logs.append({"date": date, "content": content})
+        
+        return logs
+    
+    def get_daily_report(self, date: str = None):
+        """Get daily activity report"""
+        if date is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+        
+        # Load all data
+        coaches_data = self._load_data(self.coaches_file)
+        users_data = self._load_data(self.requests_file)
+        transactions_data = self._load_data(self.requests_file)
+        
+        # Count active coaches and users
+        active_coaches = len([c for c in coaches_data.get("coaches", []) if c["status"] == "active"])
+        active_users = len([u for u in users_data.get("users", []) if u["status"] == "active"])
+        
+        # Calculate today's transactions
+        today_transactions = [
+            t for t in transactions_data.get("transactions", [])
+            if t.get("date", "").startswith(date)
+        ]
+        
+        total_revenue = sum(t.get("amount", 0) for t in today_transactions)
+        total_sessions = len(today_transactions)
+        
+        return {
+            "date": date,
+            "active_coaches": active_coaches,
+            "active_users": active_users,
+            "total_sessions": total_sessions,
+            "total_revenue": total_revenue,
+            "recent_transactions": today_transactions[-5:]  # Last 5 transactions
+        }
+    
+    def get_coaches(self):
+        """Get all coaches"""
+        data = self._load_data(self.coaches_file)
+        return data.get("coaches", [])
+    
+    def get_users(self):
+        """Get all users"""
+        data = self._load_data(self.requests_file)
+        return data.get("users", [])
+    
+    def get_storage(self):
+        """Get all storage buckets"""
+        data = self._load_data(self.requests_file)
+        return data.get("buckets", [])
+
     def process_annotation_request(self, student_email: str, student_name: str,
                                  coach_email: str, video_filename: str, 
                                  message: str = "") -> Dict:
-        """Main function to process an annotation request"""
+        """Main function to process an annotation request with video permissions"""
+        
+        # First, upload/register the video
+        video_result = self.video_permissions.upload_video(
+            student_email=student_email,
+            video_filename=video_filename
+        )
+        
+        if not video_result["success"]:
+            return {"success": False, "error": f"Failed to upload video: {video_result.get('error', 'Unknown error')}"}
+        
+        video_id = video_result["video_id"]
         
         # Check if coach exists
         coach_exists = self.check_coach_exists(coach_email)
@@ -281,6 +370,13 @@ class CoachNotificationSystem:
                 message=message
             )
             
+            # Assign coach permissions (read and edit only, no delete)
+            permission_result = self.video_permissions.assign_coach_permissions(
+                video_id=video_id,
+                coach_email=coach_email,
+                request_id=request["id"]
+            )
+            
             # Send notification
             notification_sent = self.send_coach_notification(request["id"])
             
@@ -288,9 +384,11 @@ class CoachNotificationSystem:
                 "success": True,
                 "coach_exists": True,
                 "request_id": request["id"],
+                "video_id": video_id,
                 "notification_sent": notification_sent,
+                "permissions_assigned": permission_result["success"],
                 "estimated_cost": request["estimated_cost"],
-                "message": f"Request sent to {coach_name}. Email notification {'sent' if notification_sent else 'failed'}."
+                "message": f"Request sent to {coach_name}. Video permissions assigned. Email notification {'sent' if notification_sent else 'failed'}."
             }
         
         else:
@@ -300,19 +398,21 @@ class CoachNotificationSystem:
                 student_name=student_name,
                 coach_email=coach_email,
                 video_filename=video_filename,
-                message=message
+                message=message,
+                video_id=video_id
             )
             
             return {
                 "success": True,
                 "coach_exists": False,
                 "invitation_id": invitation["id"],
-                "message": f"Coach invitation sent to {coach_email}. They will be notified to join the platform."
+                "video_id": video_id,
+                "message": f"Coach invitation sent to {coach_email}. Video uploaded and ready for when coach joins."
             }
     
     def _create_coach_invitation(self, student_email: str, student_name: str,
                                 coach_email: str, video_filename: str, 
-                                message: str = "") -> Dict:
+                                message: str = "", video_id: str = None):
         """Create a coach invitation for non-existing coaches"""
         data = self._load_data(self.requests_file)
         
@@ -323,6 +423,7 @@ class CoachNotificationSystem:
             "student_name": student_name,
             "coach_email": coach_email,
             "video_filename": video_filename,
+            "video_id": video_id,
             "message": message,
             "status": "pending",
             "created_at": datetime.now().isoformat(),
@@ -353,7 +454,7 @@ class CoachNotificationSystem:
                     "video_filename": invitation["video_filename"],
                     "message": invitation["message"],
                     "invitation_id": invitation["id"],
-                    "signup_url": "http://localhost:5000/coach/signup"
+                    "signup_url": "http://localhost:5001/coach/signup"
                 }
             )
             
@@ -372,7 +473,7 @@ class CoachNotificationSystem:
             self.logger.error(f"Error sending coach invitation: {str(e)}")
             return False
     
-    def get_pending_requests(self, coach_email: str = None) -> List[Dict]:
+    def get_pending_requests(self, coach_email: str = None):
         """Get pending requests, optionally filtered by coach"""
         data = self._load_data(self.requests_file)
         requests = data.get("requests", [])
